@@ -37,6 +37,7 @@
 | `selector`     | [Selector](./selector/)         |
 | `urltest`      | [URLTest](./urltest/)           |
 | `naive`        | [NaiveProxy](./naive/)          |
+| `naive-xhttp`  | [Naive XHTTP](./naive-xhttp/)   |
 
 #### tag
 

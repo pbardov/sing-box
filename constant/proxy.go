@@ -14,6 +14,7 @@ const (
 	TypeVMess        = "vmess"
 	TypeTrojan       = "trojan"
 	TypeNaive        = "naive"
+	TypeNaiveXHTTP   = "naive-xhttp"
 	TypeWireGuard    = "wireguard"
 	TypeHysteria     = "hysteria"
 	TypeTor          = "tor"
@@ -66,6 +67,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Trojan"
 	case TypeNaive:
 		return "Naive"
+	case TypeNaiveXHTTP:
+		return "Naive XHTTP"
 	case TypeWireGuard:
 		return "WireGuard"
 	case TypeHysteria:

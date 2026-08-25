@@ -17,4 +17,7 @@ func registerNaiveOutbound(registry *outbound.Registry) {
 	outbound.Register[option.NaiveOutboundOptions](registry, C.TypeNaive, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveOutboundOptions) (adapter.Outbound, error) {
 		return nil, E.New(`naive outbound is not included in this build, rebuild with -tags with_naive_outbound`)
 	})
+	outbound.Register[option.NaiveXHTTPOutboundOptions](registry, C.TypeNaiveXHTTP, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveXHTTPOutboundOptions) (adapter.Outbound, error) {
+		return nil, E.New(`naive-xhttp outbound is not included in this build, rebuild with -tags with_naive_outbound`)
+	})
 }
