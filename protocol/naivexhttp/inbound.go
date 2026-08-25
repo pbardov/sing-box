@@ -64,9 +64,11 @@ type inboundSession struct {
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveXHTTPInboundOptions) (adapter.Inbound, error) {
 	basePath, _ := normalizeBasePath(options.Path)
-	networks := options.Network.Build()
-	if len(networks) == 0 {
+	var networks []string
+	if options.Network == "" {
 		networks = []string{N.NetworkTCP}
+	} else {
+		networks = options.Network.Build()
 	}
 	for _, networkName := range networks {
 		if networkName != N.NetworkTCP {
