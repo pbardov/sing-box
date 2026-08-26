@@ -28,6 +28,7 @@ type NaiveXHTTPOutboundOptions struct {
 	ExtraHeaders             badoption.HTTPHeader     `json:"extra_headers,omitempty"`
 	MaxEachPostBytes         int                      `json:"sc_max_each_post_bytes,omitempty"`
 	MinPostsIntervalMs       int                      `json:"sc_min_posts_interval_ms,omitempty"`
+	HTTP1                    bool                     `json:"http1,omitempty"`
 	ReceiveWindow            *byteformats.MemoryBytes `json:"stream_receive_window,omitempty"`
 	UDPOverTCP               *UDPOverTCPOptions       `json:"udp_over_tcp,omitempty"`
 	QUIC                     bool                     `json:"quic,omitempty"`

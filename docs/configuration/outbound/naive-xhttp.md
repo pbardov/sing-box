@@ -29,6 +29,7 @@ outbound, but opens an XHTTP `packet-up` style tunnel instead of HTTP CONNECT.
   "extra_headers": {},
   "sc_max_each_post_bytes": 1000000,
   "sc_min_posts_interval_ms": 0,
+  "http1": false,
   "stream_receive_window": "",
   "udp_over_tcp": false | {},
   "quic": false,
@@ -103,6 +104,16 @@ Default: `1000000`.
 #### sc_min_posts_interval_ms
 
 Minimum interval between upload `POST` requests.
+
+#### http1
+
+Use the Go HTTP/1.1 client path instead of the Cronet HTTP/2 client path.
+
+This mode is intended for CGI/shared-hosting relays that do not reliably handle
+the Cronet HTTP/2 request pattern. It also sends the destination as
+`X-Naive-Target` in addition to `-connect-authority`.
+
+`http1` and `quic` are mutually exclusive.
 
 #### stream_receive_window
 

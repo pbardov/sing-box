@@ -5,6 +5,7 @@ package naivexhttp
 import (
 	"bytes"
 	"context"
+	stdTLS "crypto/tls"
 	"encoding/base64"
 	"encoding/pem"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
+	boxTLS "github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/log"
@@ -48,6 +50,8 @@ type Outbound struct {
 	client        *cronet.NaiveClient
 	executor      cronet.Executor
 	roundTripper  *cronet.RoundTripper
+	httpClient    *http.Client
+	httpTransport *http.Transport
 	uotClient     *uot.Client
 	baseURL       url.URL
 	extraHeaders  map[string]string
@@ -55,6 +59,8 @@ type Outbound struct {
 	maxUploadSize int
 	postInterval  time.Duration
 	quic          bool
+	http1         bool
+	postAccess    sync.Mutex
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveXHTTPOutboundOptions) (adapter.Outbound, error) {
@@ -99,6 +105,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	if options.TLS.Reality != nil && options.TLS.Reality.Enabled {
 		return nil, E.New("reality is not supported on naive-xhttp outbound")
+	}
+	if options.HTTP1 && options.QUIC {
+		return nil, E.New("http1 and quic are mutually exclusive on naive-xhttp outbound")
 	}
 
 	serverAddress := options.ServerOptions.Build()
@@ -196,25 +205,53 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, E.New("unknown quic congestion control: ", options.QUICCongestionControl)
 	}
 
-	client, err := cronet.NewNaiveClient(cronet.NaiveClientOptions{
-		Context:                  ctx,
-		Logger:                   logger,
-		ServerAddress:            serverAddress,
-		ServerName:               serverName,
-		ExtraHeaders:             extraHeaders,
-		ReceiveWindow:            options.ReceiveWindow.Value(),
-		TrustedRootCertificates:  trustedRootCertificates,
-		Dialer:                   outboundDialer,
-		DNSResolver:              dnsResolver,
-		ECHEnabled:               echEnabled,
-		ECHConfigList:            echConfigList,
-		ECHQueryServerName:       echQueryServerName,
-		QUIC:                     options.QUIC,
-		QUICCongestionControl:    quicCongestionControl,
-		QUICSessionReceiveWindow: options.QUICSessionReceiveWindow.Value(),
-	})
-	if err != nil {
-		return nil, err
+	var client *cronet.NaiveClient
+	var httpClient *http.Client
+	var httpTransport *http.Transport
+	if options.HTTP1 {
+		tlsConfig, err := boxTLS.NewClientWithOptions(boxTLS.ClientOptions{
+			Context:       ctx,
+			Logger:        logger,
+			ServerAddress: serverName,
+			Options:       *options.TLS,
+		})
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.SetNextProtos([]string{"http/1.1"})
+		tlsDialer := boxTLS.NewDialer(outboundDialer, tlsConfig)
+		httpTransport = &http.Transport{
+			DisableCompression: true,
+			ForceAttemptHTTP2:  false,
+			TLSNextProto:       make(map[string]func(string, *stdTLS.Conn) http.RoundTripper),
+			DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return tlsDialer.DialTLSContext(ctx, serverAddress)
+			},
+		}
+		httpClient = &http.Client{
+			Transport: httpTransport,
+		}
+	} else {
+		client, err = cronet.NewNaiveClient(cronet.NaiveClientOptions{
+			Context:                  ctx,
+			Logger:                   logger,
+			ServerAddress:            serverAddress,
+			ServerName:               serverName,
+			ExtraHeaders:             extraHeaders,
+			ReceiveWindow:            options.ReceiveWindow.Value(),
+			TrustedRootCertificates:  trustedRootCertificates,
+			Dialer:                   outboundDialer,
+			DNSResolver:              dnsResolver,
+			ECHEnabled:               echEnabled,
+			ECHConfigList:            echConfigList,
+			ECHQueryServerName:       echQueryServerName,
+			QUIC:                     options.QUIC,
+			QUICCongestionControl:    quicCongestionControl,
+			QUICSessionReceiveWindow: options.QUICSessionReceiveWindow.Value(),
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var authorization string
@@ -254,6 +291,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		ctx:           ctx,
 		logger:        logger,
 		client:        client,
+		httpClient:    httpClient,
+		httpTransport: httpTransport,
 		uotClient:     uotClient,
 		baseURL:       baseURL,
 		extraHeaders:  extraHeaders,
@@ -261,6 +300,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		maxUploadSize: maxUploadSize,
 		postInterval:  time.Duration(options.MinPostsIntervalMs) * time.Millisecond,
 		quic:          options.QUIC,
+		http1:         options.HTTP1,
 	}
 	if uotClient != nil {
 		uotClient.Dialer = &naiveXHTTPDialer{outbound: outbound}
@@ -270,6 +310,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 func (h *Outbound) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
+		return nil
+	}
+	if h.http1 {
 		return nil
 	}
 	err := h.client.Start()
@@ -314,13 +357,24 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 }
 
 func (h *Outbound) InterfaceUpdated() {
-	h.client.Engine().CloseAllConnections()
+	if h.client != nil {
+		h.client.Engine().CloseAllConnections()
+	}
+	if h.httpTransport != nil {
+		h.httpTransport.CloseIdleConnections()
+	}
 }
 
 func (h *Outbound) Close() error {
-	err := h.client.Close()
+	var err error
+	if h.client != nil {
+		err = h.client.Close()
+	}
 	if h.executor != (cronet.Executor{}) {
 		h.executor.Destroy()
+	}
+	if h.httpTransport != nil {
+		h.httpTransport.CloseIdleConnections()
 	}
 	return err
 }
@@ -336,6 +390,28 @@ func (h *Outbound) dialXHTTP(ctx context.Context, destination M.Socksaddr) (net.
 	}
 	downURL := h.sessionURL(sessionID, "")
 	headers := h.requestHeaders(downURL, destination)
+	if h.http1 {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, downURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		for key, value := range headers {
+			request.Header.Set(key, value)
+		}
+		response, err := h.httpClient.Do(request)
+		if err != nil {
+			return nil, err
+		}
+		if response.StatusCode != http.StatusOK {
+			response.Body.Close()
+			return nil, E.New("unexpected response status: ", response.StatusCode)
+		}
+		writer := newPacketUploadWriter(ctx, h, sessionID)
+		return &splitConn{
+			reader: response.Body,
+			writer: writer,
+		}, nil
+	}
 	conn := h.client.Engine().StreamEngine().CreateConn(ctx, h.logger, true, false)
 	err = conn.Start(http.MethodGet, downURL, headers, 0, true)
 	if err != nil {
@@ -374,7 +450,11 @@ func (h *Outbound) requestHeaders(rawURL string, destination M.Socksaddr) map[st
 		"Referer":       requestPadding(rawURL),
 	}
 	if destination.IsValid() {
-		headers[headerConnectAuthority] = destination.String()
+		target := destination.String()
+		headers[headerConnectAuthority] = target
+		if h.http1 {
+			headers["X-Naive-Target"] = target
+		}
 	}
 	if h.authorization != "" {
 		headers["Proxy-Authorization"] = h.authorization
@@ -405,7 +485,7 @@ func (h *Outbound) postPacket(ctx context.Context, sessionID string, seq uint64,
 	}
 	request.ContentLength = int64(len(payload))
 	h.applyHeaders(request, rawURL, M.Socksaddr{})
-	response, err := h.roundTripper.RoundTrip(request)
+	response, err := h.postRoundTrip(request)
 	if err != nil {
 		return err
 	}
@@ -415,6 +495,15 @@ func (h *Outbound) postPacket(ctx context.Context, sessionID string, seq uint64,
 		return E.New("unexpected upload response status: ", response.Status)
 	}
 	return nil
+}
+
+func (h *Outbound) postRoundTrip(request *http.Request) (*http.Response, error) {
+	if h.http1 {
+		return h.httpClient.Do(request)
+	}
+	h.postAccess.Lock()
+	defer h.postAccess.Unlock()
+	return h.roundTripper.RoundTrip(request)
 }
 
 type packetUploadWriter struct {
