@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
+	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/uot"
 	C "github.com/sagernet/sing-box/constant"
@@ -96,6 +97,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		host:             options.Host,
 		maxEachPostBytes: options.MaxEachPostBytes,
 		maxBufferedPosts: options.MaxBufferedPosts,
+	}
+	var err error
+	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
+	if err != nil {
+		return nil, err
 	}
 	if inbound.maxEachPostBytes <= 0 {
 		inbound.maxEachPostBytes = defaultMaxEachPostBytes

@@ -30,8 +30,10 @@ outbound, but opens an XHTTP `packet-up` style tunnel instead of HTTP CONNECT.
   "sc_max_each_post_bytes": 1000000,
   "sc_min_posts_interval_ms": 0,
   "http1": false,
+  "http1_max_connections": 2,
   "stream_receive_window": "",
   "udp_over_tcp": false | {},
+  "multiplex": {},
   "quic": false,
   "quic_congestion_control": "",
   "quic_session_receive_window": "",
@@ -115,6 +117,16 @@ the Cronet HTTP/2 request pattern. It also sends the destination as
 
 `http1` and `quic` are mutually exclusive.
 
+#### http1_max_connections
+
+Maximum active HTTP/1.1 downlink requests to the public endpoint when `http1`
+is enabled.
+
+HTTP/1.1 upload `POST` requests are serialized by the outbound so CGI relays do
+not receive one upload request per active tunnel at the same time.
+
+Default: `2`.
+
 #### stream_receive_window
 
 Cronet stream receive window.
@@ -124,6 +136,16 @@ Cronet stream receive window.
 UDP over TCP protocol settings.
 
 See [UDP Over TCP](/configuration/shared/udp-over-tcp/) for details.
+
+Conflict with `multiplex`.
+
+#### multiplex
+
+See [Multiplex](/configuration/shared/multiplex#outbound) for details.
+
+For HTTP/1.1 CGI relays with small worker pools, multiplex can collapse many
+logical TCP connections into one or a few long-lived XHTTP downlink requests.
+Use `max_connections` to cap the number of underlying XHTTP sessions.
 
 #### quic
 

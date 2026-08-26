@@ -24,6 +24,7 @@ the `naive-xhttp` outbound.
   "sc_max_each_post_bytes": 1000000,
   "sc_max_buffered_posts": 30,
   "no_sse_header": false,
+  "multiplex": {},
   "tls": {}
 }
 ```
@@ -74,6 +75,10 @@ Default: `30`.
 #### no_sse_header
 
 Do not set `Content-Type: text/event-stream` on the downlink response.
+
+#### multiplex
+
+See [Multiplex](/configuration/shared/multiplex#inbound) for details.
 
 #### tls
 

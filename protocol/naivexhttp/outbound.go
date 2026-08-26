@@ -23,6 +23,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/mux"
 	boxTLS "github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
@@ -43,24 +44,28 @@ func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.NaiveXHTTPOutboundOptions](registry, C.TypeNaiveXHTTP, NewOutbound)
 }
 
+var _ adapter.OutboundWithMultiplex = (*Outbound)(nil)
+
 type Outbound struct {
 	outbound.Adapter
-	ctx           context.Context
-	logger        logger.ContextLogger
-	client        *cronet.NaiveClient
-	executor      cronet.Executor
-	roundTripper  *cronet.RoundTripper
-	httpClient    *http.Client
-	httpTransport *http.Transport
-	uotClient     *uot.Client
-	baseURL       url.URL
-	extraHeaders  map[string]string
-	authorization string
-	maxUploadSize int
-	postInterval  time.Duration
-	quic          bool
-	http1         bool
-	postAccess    sync.Mutex
+	ctx             context.Context
+	logger          logger.ContextLogger
+	client          *cronet.NaiveClient
+	executor        cronet.Executor
+	roundTripper    *cronet.RoundTripper
+	httpClient      *http.Client
+	httpTransport   *http.Transport
+	http1Access     chan struct{}
+	uotClient       *uot.Client
+	multiplexDialer *mux.Client
+	baseURL         url.URL
+	extraHeaders    map[string]string
+	authorization   string
+	maxUploadSize   int
+	postInterval    time.Duration
+	quic            bool
+	http1           bool
+	postAccess      sync.Mutex
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveXHTTPOutboundOptions) (adapter.Outbound, error) {
@@ -208,7 +213,13 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	var client *cronet.NaiveClient
 	var httpClient *http.Client
 	var httpTransport *http.Transport
+	var http1Access chan struct{}
 	if options.HTTP1 {
+		http1MaxConnections := options.HTTP1MaxConnections
+		if http1MaxConnections <= 0 {
+			http1MaxConnections = 2
+		}
+		http1Access = make(chan struct{}, http1MaxConnections)
 		tlsConfig, err := boxTLS.NewClientWithOptions(boxTLS.ClientOptions{
 			Context:       ctx,
 			Logger:        logger,
@@ -280,6 +291,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			Version: uotOptions.Version,
 		}
 	}
+	var multiplexDialer *mux.Client
+	xhttpDialer := &naiveXHTTPDialer{}
+	if !uotOptions.Enabled {
+		multiplexDialer, err = mux.NewClientWithOptions(xhttpDialer, logger, common.PtrValueOrDefault(options.Multiplex))
+		if err != nil {
+			return nil, err
+		}
+	}
 	var networks []string
 	if uotClient != nil {
 		networks = []string{N.NetworkTCP, N.NetworkUDP}
@@ -287,24 +306,27 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		networks = []string{N.NetworkTCP}
 	}
 	outbound := &Outbound{
-		Adapter:       outbound.NewAdapterWithDialerOptions(C.TypeNaiveXHTTP, tag, networks, options.DialerOptions),
-		ctx:           ctx,
-		logger:        logger,
-		client:        client,
-		httpClient:    httpClient,
-		httpTransport: httpTransport,
-		uotClient:     uotClient,
-		baseURL:       baseURL,
-		extraHeaders:  extraHeaders,
-		authorization: authorization,
-		maxUploadSize: maxUploadSize,
-		postInterval:  time.Duration(options.MinPostsIntervalMs) * time.Millisecond,
-		quic:          options.QUIC,
-		http1:         options.HTTP1,
+		Adapter:         outbound.NewAdapterWithDialerOptions(C.TypeNaiveXHTTP, tag, networks, options.DialerOptions),
+		ctx:             ctx,
+		logger:          logger,
+		client:          client,
+		httpClient:      httpClient,
+		httpTransport:   httpTransport,
+		http1Access:     http1Access,
+		uotClient:       uotClient,
+		multiplexDialer: multiplexDialer,
+		baseURL:         baseURL,
+		extraHeaders:    extraHeaders,
+		authorization:   authorization,
+		maxUploadSize:   maxUploadSize,
+		postInterval:    time.Duration(options.MinPostsIntervalMs) * time.Millisecond,
+		quic:            options.QUIC,
+		http1:           options.HTTP1,
 	}
 	if uotClient != nil {
 		uotClient.Dialer = &naiveXHTTPDialer{outbound: outbound}
 	}
+	xhttpDialer.outbound = outbound
 	return outbound, nil
 }
 
@@ -334,6 +356,18 @@ func (h *Outbound) Start(stage adapter.StartStage) error {
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	ctx, metadata := adapter.ExtendContext(ctx)
+	metadata.Outbound = h.Tag()
+	metadata.Destination = destination
+	if h.multiplexDialer != nil {
+		switch N.NetworkName(network) {
+		case N.NetworkTCP:
+			h.logger.InfoContext(ctx, "outbound naive-xhttp multiplex connection to ", destination)
+		case N.NetworkUDP:
+			h.logger.InfoContext(ctx, "outbound naive-xhttp multiplex packet connection to ", destination)
+		}
+		return h.multiplexDialer.DialContext(ctx, network, destination)
+	}
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		h.logger.InfoContext(ctx, "outbound naive-xhttp connection to ", destination)
@@ -350,10 +384,21 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	ctx, metadata := adapter.ExtendContext(ctx)
+	metadata.Outbound = h.Tag()
+	metadata.Destination = destination
+	if h.multiplexDialer != nil {
+		h.logger.InfoContext(ctx, "outbound naive-xhttp multiplex packet connection to ", destination)
+		return h.multiplexDialer.ListenPacket(ctx, destination)
+	}
 	if h.uotClient == nil {
 		return nil, E.New("UDP is not supported unless UDP over TCP is enabled")
 	}
 	return h.uotClient.ListenPacket(ctx, destination)
+}
+
+func (h *Outbound) MultiplexEnabled() bool {
+	return h.multiplexDialer != nil
 }
 
 func (h *Outbound) InterfaceUpdated() {
@@ -363,12 +408,20 @@ func (h *Outbound) InterfaceUpdated() {
 	if h.httpTransport != nil {
 		h.httpTransport.CloseIdleConnections()
 	}
+	if h.multiplexDialer != nil {
+		h.multiplexDialer.Reset()
+	}
 }
 
 func (h *Outbound) Close() error {
 	var err error
+	if h.multiplexDialer != nil {
+		err = h.multiplexDialer.Close()
+	}
 	if h.client != nil {
-		err = h.client.Close()
+		err = E.Append(err, h.client.Close(), func(err error) error {
+			return err
+		})
 	}
 	if h.executor != (cronet.Executor{}) {
 		h.executor.Destroy()
@@ -390,47 +443,93 @@ func (h *Outbound) dialXHTTP(ctx context.Context, destination M.Socksaddr) (net.
 	}
 	downURL := h.sessionURL(sessionID, "")
 	headers := h.requestHeaders(downURL, destination)
+	connCtx, stopWatching, cancelConn := detachAfterDialContext(ctx)
 	if h.http1 {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, downURL, nil)
+		release, err := h.acquireHTTP1(ctx)
 		if err != nil {
+			stopWatching()
+			cancelConn()
+			return nil, err
+		}
+		request, err := http.NewRequestWithContext(connCtx, http.MethodGet, downURL, nil)
+		if err != nil {
+			stopWatching()
+			cancelConn()
+			release()
 			return nil, err
 		}
 		for key, value := range headers {
 			request.Header.Set(key, value)
 		}
 		response, err := h.httpClient.Do(request)
+		stopWatching()
 		if err != nil {
+			cancelConn()
+			release()
 			return nil, err
 		}
 		if response.StatusCode != http.StatusOK {
 			response.Body.Close()
+			cancelConn()
+			release()
 			return nil, E.New("unexpected response status: ", response.StatusCode)
 		}
-		writer := newPacketUploadWriter(ctx, h, sessionID)
+		writer := newPacketUploadWriter(connCtx, h, sessionID)
 		return &splitConn{
 			reader: response.Body,
 			writer: writer,
+			onClose: func() {
+				cancelConn()
+				release()
+			},
 		}, nil
 	}
-	conn := h.client.Engine().StreamEngine().CreateConn(ctx, h.logger, true, false)
+	conn := h.client.Engine().StreamEngine().CreateConn(connCtx, h.logger, true, false)
 	err = conn.Start(http.MethodGet, downURL, headers, 0, true)
 	if err != nil {
+		stopWatching()
+		cancelConn()
 		return nil, err
 	}
-	responseHeaders, err := conn.WaitForHeadersContext(ctx)
+	responseHeaders, err := conn.WaitForHeadersContext(connCtx)
+	stopWatching()
 	if err != nil {
 		conn.Close()
+		cancelConn()
 		return nil, err
 	}
 	if responseHeaders[":status"] != "200" {
 		conn.Close()
+		cancelConn()
 		return nil, E.New("unexpected response status: ", responseHeaders[":status"])
 	}
-	writer := newPacketUploadWriter(ctx, h, sessionID)
+	writer := newPacketUploadWriter(connCtx, h, sessionID)
 	return &splitConn{
-		reader: conn,
-		writer: writer,
+		reader:  conn,
+		writer:  writer,
+		onClose: cancelConn,
 	}, nil
+}
+
+func detachAfterDialContext(parent context.Context) (context.Context, func(), context.CancelFunc) {
+	// Mux uses a short dial context for opening the underlying tunnel; the
+	// returned XHTTP stream must survive that context after response headers.
+	connCtx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	done := make(chan struct{})
+	var doneOnce sync.Once
+	stopWatching := func() {
+		doneOnce.Do(func() {
+			close(done)
+		})
+	}
+	go func() {
+		select {
+		case <-parent.Done():
+			cancel()
+		case <-done:
+		}
+	}()
+	return connCtx, stopWatching, cancel
 }
 
 func (h *Outbound) sessionURL(sessionID string, seq string) string {
@@ -498,12 +597,29 @@ func (h *Outbound) postPacket(ctx context.Context, sessionID string, seq uint64,
 }
 
 func (h *Outbound) postRoundTrip(request *http.Request) (*http.Response, error) {
+	h.postAccess.Lock()
+	defer h.postAccess.Unlock()
 	if h.http1 {
 		return h.httpClient.Do(request)
 	}
-	h.postAccess.Lock()
-	defer h.postAccess.Unlock()
 	return h.roundTripper.RoundTrip(request)
+}
+
+func (h *Outbound) acquireHTTP1(ctx context.Context) (func(), error) {
+	if h.http1Access == nil {
+		return func() {}, nil
+	}
+	select {
+	case h.http1Access <- struct{}{}:
+		var releaseOnce sync.Once
+		return func() {
+			releaseOnce.Do(func() {
+				<-h.http1Access
+			})
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 type packetUploadWriter struct {

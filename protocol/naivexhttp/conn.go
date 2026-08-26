@@ -13,6 +13,7 @@ type splitConn struct {
 	writer     io.WriteCloser
 	localAddr  net.Addr
 	remoteAddr net.Addr
+	onClose    func()
 	closeOnce  sync.Once
 }
 
@@ -30,6 +31,9 @@ func (c *splitConn) Close() error {
 		err = c.writer.Close()
 		if readErr := c.reader.Close(); err == nil {
 			err = readErr
+		}
+		if c.onClose != nil {
+			c.onClose()
 		}
 	})
 	return err
