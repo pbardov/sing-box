@@ -48,24 +48,27 @@ var _ adapter.OutboundWithMultiplex = (*Outbound)(nil)
 
 type Outbound struct {
 	outbound.Adapter
-	ctx             context.Context
-	logger          logger.ContextLogger
-	client          *cronet.NaiveClient
-	executor        cronet.Executor
-	roundTripper    *cronet.RoundTripper
-	httpClient      *http.Client
-	httpTransport   *http.Transport
-	http1Access     chan struct{}
-	uotClient       *uot.Client
-	multiplexDialer *mux.Client
-	baseURL         url.URL
-	extraHeaders    map[string]string
-	authorization   string
-	maxUploadSize   int
-	postInterval    time.Duration
-	quic            bool
-	http1           bool
-	postAccess      sync.Mutex
+	ctx                 context.Context
+	logger              logger.ContextLogger
+	client              *cronet.NaiveClient
+	executor            cronet.Executor
+	roundTripper        *cronet.RoundTripper
+	httpClient          *http.Client
+	httpTransport       *http.Transport
+	http1Access         chan struct{}
+	uotClient           *uot.Client
+	multiplexDialer     *mux.Client
+	baseURL             url.URL
+	extraHeaders        map[string]string
+	authorization       string
+	maxUploadSize       int
+	postInterval        time.Duration
+	uploadCoalesceBytes int
+	uploadCoalesceDelay time.Duration
+	maxConcurrentPosts  int
+	quic                bool
+	http1               bool
+	postAccess          chan struct{}
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveXHTTPOutboundOptions) (adapter.Outbound, error) {
@@ -282,6 +285,21 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if maxUploadSize <= 0 {
 		maxUploadSize = defaultMaxEachPostBytes
 	}
+	uploadCoalesceBytes := options.UploadCoalesceBytes
+	if uploadCoalesceBytes < 0 {
+		return nil, E.New("invalid upload coalesce bytes: ", uploadCoalesceBytes)
+	}
+	if uploadCoalesceBytes > maxUploadSize {
+		uploadCoalesceBytes = maxUploadSize
+	}
+	uploadCoalesceDelay := time.Duration(options.UploadCoalesceDelayMs) * time.Millisecond
+	if uploadCoalesceDelay < 0 {
+		return nil, E.New("invalid upload coalesce delay: ", options.UploadCoalesceDelayMs)
+	}
+	maxConcurrentPosts := options.MaxConcurrentPosts
+	if maxConcurrentPosts <= 0 {
+		maxConcurrentPosts = 1
+	}
 
 	var uotClient *uot.Client
 	uotOptions := common.PtrValueOrDefault(options.UDPOverTCP)
@@ -306,22 +324,26 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		networks = []string{N.NetworkTCP}
 	}
 	outbound := &Outbound{
-		Adapter:         outbound.NewAdapterWithDialerOptions(C.TypeNaiveXHTTP, tag, networks, options.DialerOptions),
-		ctx:             ctx,
-		logger:          logger,
-		client:          client,
-		httpClient:      httpClient,
-		httpTransport:   httpTransport,
-		http1Access:     http1Access,
-		uotClient:       uotClient,
-		multiplexDialer: multiplexDialer,
-		baseURL:         baseURL,
-		extraHeaders:    extraHeaders,
-		authorization:   authorization,
-		maxUploadSize:   maxUploadSize,
-		postInterval:    time.Duration(options.MinPostsIntervalMs) * time.Millisecond,
-		quic:            options.QUIC,
-		http1:           options.HTTP1,
+		Adapter:             outbound.NewAdapterWithDialerOptions(C.TypeNaiveXHTTP, tag, networks, options.DialerOptions),
+		ctx:                 ctx,
+		logger:              logger,
+		client:              client,
+		httpClient:          httpClient,
+		httpTransport:       httpTransport,
+		http1Access:         http1Access,
+		uotClient:           uotClient,
+		multiplexDialer:     multiplexDialer,
+		baseURL:             baseURL,
+		extraHeaders:        extraHeaders,
+		authorization:       authorization,
+		maxUploadSize:       maxUploadSize,
+		postInterval:        time.Duration(options.MinPostsIntervalMs) * time.Millisecond,
+		uploadCoalesceBytes: uploadCoalesceBytes,
+		uploadCoalesceDelay: uploadCoalesceDelay,
+		maxConcurrentPosts:  maxConcurrentPosts,
+		quic:                options.QUIC,
+		http1:               options.HTTP1,
+		postAccess:          make(chan struct{}, maxConcurrentPosts),
 	}
 	if uotClient != nil {
 		uotClient.Dialer = &naiveXHTTPDialer{outbound: outbound}
@@ -597,12 +619,32 @@ func (h *Outbound) postPacket(ctx context.Context, sessionID string, seq uint64,
 }
 
 func (h *Outbound) postRoundTrip(request *http.Request) (*http.Response, error) {
-	h.postAccess.Lock()
-	defer h.postAccess.Unlock()
+	release, err := h.acquirePost(request.Context())
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if h.http1 {
 		return h.httpClient.Do(request)
 	}
 	return h.roundTripper.RoundTrip(request)
+}
+
+func (h *Outbound) acquirePost(ctx context.Context) (func(), error) {
+	if h.postAccess == nil {
+		return func() {}, nil
+	}
+	select {
+	case h.postAccess <- struct{}{}:
+		var releaseOnce sync.Once
+		return func() {
+			releaseOnce.Do(func() {
+				<-h.postAccess
+			})
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (h *Outbound) acquireHTTP1(ctx context.Context) (func(), error) {
@@ -689,17 +731,32 @@ func (w *packetUploadWriter) loop() {
 	defer close(w.done)
 	var seq uint64
 	var lastPost time.Time
-	for {
-		var payload []byte
+	var pending []byte
+	maxConcurrentPosts := w.outbound.maxConcurrentPosts
+	if maxConcurrentPosts <= 0 {
+		maxConcurrentPosts = 1
+	}
+	results := make(chan error, maxConcurrentPosts)
+	var inFlight int
+	waitPost := func() bool {
 		select {
-		case <-w.closed:
-			return
-		default:
+		case err := <-results:
+			inFlight--
+			if err != nil {
+				w.setError(err)
+				return false
+			}
+			return true
+		case <-w.ctx.Done():
+			w.setError(w.ctx.Err())
+			return false
 		}
-		select {
-		case payload = <-w.uploads:
-		case <-w.closed:
-			return
+	}
+	sendPost := func(payload []byte) bool {
+		for inFlight >= maxConcurrentPosts {
+			if !waitPost() {
+				return false
+			}
 		}
 		if w.outbound.postInterval > 0 && !lastPost.IsZero() {
 			delay := w.outbound.postInterval - time.Since(lastPost)
@@ -709,21 +766,159 @@ func (w *packetUploadWriter) loop() {
 				case <-timer.C:
 				case <-w.closed:
 					timer.Stop()
-					return
+					return false
 				case <-w.ctx.Done():
 					timer.Stop()
 					w.setError(w.ctx.Err())
-					return
+					return false
 				}
 			}
 		}
+		postSeq := seq
+		seq++
 		lastPost = time.Now()
-		err := w.outbound.postPacket(w.ctx, w.sessionID, seq, payload)
+		inFlight++
+		go func() {
+			results <- w.outbound.postPacket(w.ctx, w.sessionID, postSeq, payload)
+		}()
+		return true
+	}
+	for {
+		payload, ok, err := w.nextPayload(&pending)
 		if err != nil {
 			w.setError(err)
 			return
 		}
-		seq++
+		if !ok {
+			break
+		}
+		if !sendPost(payload) {
+			return
+		}
+	}
+	for inFlight > 0 {
+		if !waitPost() {
+			return
+		}
+	}
+}
+
+func (w *packetUploadWriter) nextPayload(pending *[]byte) ([]byte, bool, error) {
+	coalesceLimit := w.outbound.uploadCoalesceBytes
+	if coalesceLimit <= 0 {
+		return w.nextRawPayload(pending)
+	}
+	if coalesceLimit > w.outbound.maxUploadSize {
+		coalesceLimit = w.outbound.maxUploadSize
+	}
+	if coalesceLimit <= 0 {
+		return w.nextRawPayload(pending)
+	}
+	payload := make([]byte, 0, coalesceLimit)
+	appendPayload := func(chunk []byte) {
+		available := coalesceLimit - len(payload)
+		if len(chunk) <= available {
+			payload = append(payload, chunk...)
+			*pending = nil
+			return
+		}
+		payload = append(payload, chunk[:available]...)
+		*pending = append((*pending)[:0], chunk[available:]...)
+	}
+	firstChunk, ok, err := w.nextRawPayload(pending)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	appendPayload(firstChunk)
+	if len(payload) >= coalesceLimit {
+		return payload, true, nil
+	}
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	if w.outbound.uploadCoalesceDelay > 0 {
+		timer = time.NewTimer(w.outbound.uploadCoalesceDelay)
+		timerC = timer.C
+		defer timer.Stop()
+	}
+	for len(payload) < coalesceLimit {
+		if len(*pending) > 0 {
+			appendPayload(*pending)
+			continue
+		}
+		if timerC == nil {
+			select {
+			case chunk := <-w.uploads:
+				appendPayload(chunk)
+			case <-w.closed:
+				w.drainQueuedPayloads(&payload, pending, coalesceLimit)
+				return payload, true, nil
+			case <-w.ctx.Done():
+				return nil, false, w.ctx.Err()
+			default:
+				return payload, true, nil
+			}
+			continue
+		}
+		select {
+		case chunk := <-w.uploads:
+			appendPayload(chunk)
+		case <-timerC:
+			return payload, true, nil
+		case <-w.closed:
+			w.drainQueuedPayloads(&payload, pending, coalesceLimit)
+			return payload, true, nil
+		case <-w.ctx.Done():
+			return nil, false, w.ctx.Err()
+		}
+	}
+	return payload, true, nil
+}
+
+func (w *packetUploadWriter) nextRawPayload(pending *[]byte) ([]byte, bool, error) {
+	if len(*pending) > 0 {
+		payload := *pending
+		*pending = nil
+		return payload, true, nil
+	}
+	select {
+	case payload := <-w.uploads:
+		return payload, true, nil
+	case <-w.closed:
+		select {
+		case payload := <-w.uploads:
+			return payload, true, nil
+		default:
+			return nil, false, nil
+		}
+	case <-w.ctx.Done():
+		return nil, false, w.ctx.Err()
+	}
+}
+
+func (w *packetUploadWriter) drainQueuedPayloads(payload *[]byte, pending *[]byte, limit int) {
+	appendPayload := func(chunk []byte) bool {
+		available := limit - len(*payload)
+		if available <= 0 {
+			*pending = append((*pending)[:0], chunk...)
+			return false
+		}
+		if len(chunk) <= available {
+			*payload = append(*payload, chunk...)
+			return true
+		}
+		*payload = append(*payload, chunk[:available]...)
+		*pending = append((*pending)[:0], chunk[available:]...)
+		return false
+	}
+	for len(*payload) < limit {
+		select {
+		case chunk := <-w.uploads:
+			if !appendPayload(chunk) {
+				return
+			}
+		default:
+			return
+		}
 	}
 }
 

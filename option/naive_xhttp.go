@@ -29,6 +29,9 @@ type NaiveXHTTPOutboundOptions struct {
 	ExtraHeaders             badoption.HTTPHeader      `json:"extra_headers,omitempty"`
 	MaxEachPostBytes         int                       `json:"sc_max_each_post_bytes,omitempty"`
 	MinPostsIntervalMs       int                       `json:"sc_min_posts_interval_ms,omitempty"`
+	UploadCoalesceBytes      int                       `json:"sc_upload_coalesce_bytes,omitempty"`
+	UploadCoalesceDelayMs    int                       `json:"sc_upload_coalesce_delay_ms,omitempty"`
+	MaxConcurrentPosts       int                       `json:"sc_max_concurrent_posts,omitempty"`
 	HTTP1                    bool                      `json:"http1,omitempty"`
 	HTTP1MaxConnections      int                       `json:"http1_max_connections,omitempty"`
 	ReceiveWindow            *byteformats.MemoryBytes  `json:"stream_receive_window,omitempty"`

@@ -29,6 +29,9 @@ outbound, but opens an XHTTP `packet-up` style tunnel instead of HTTP CONNECT.
   "extra_headers": {},
   "sc_max_each_post_bytes": 1000000,
   "sc_min_posts_interval_ms": 0,
+  "sc_upload_coalesce_bytes": 0,
+  "sc_upload_coalesce_delay_ms": 0,
+  "sc_max_concurrent_posts": 1,
   "http1": false,
   "http1_max_connections": 2,
   "stream_receive_window": "",
@@ -107,6 +110,34 @@ Default: `1000000`.
 
 Minimum interval between upload `POST` requests.
 
+#### sc_upload_coalesce_bytes
+
+Maximum buffered upload bytes to coalesce into one upload `POST`.
+
+When unset or `0`, each outbound write is sent as its own upload `POST`.
+When enabled, the value is capped by `sc_max_each_post_bytes`.
+
+Default: `0`.
+
+#### sc_upload_coalesce_delay_ms
+
+Maximum time to wait for more upload bytes before flushing a partially filled
+coalesced upload `POST`.
+
+This option is only used when `sc_upload_coalesce_bytes` is enabled.
+
+Default: `0`.
+
+#### sc_max_concurrent_posts
+
+Maximum number of upload `POST` requests in flight.
+
+Values greater than `1` can improve upload throughput on relays that can handle
+several simultaneous short CGI requests. The inbound reorders upload packets by
+`seq`, so responses may complete out of order.
+
+Default: `1`.
+
 #### http1
 
 Use the Go HTTP/1.1 client path instead of the Cronet HTTP/2 client path.
@@ -122,8 +153,9 @@ the Cronet HTTP/2 request pattern. It also sends the destination as
 Maximum active HTTP/1.1 downlink requests to the public endpoint when `http1`
 is enabled.
 
-HTTP/1.1 upload `POST` requests are serialized by the outbound so CGI relays do
-not receive one upload request per active tunnel at the same time.
+HTTP/1.1 upload `POST` concurrency is controlled by `sc_max_concurrent_posts`
+so CGI relays do not receive one upload request per active tunnel at the same
+time unless explicitly configured.
 
 Default: `2`.
 
